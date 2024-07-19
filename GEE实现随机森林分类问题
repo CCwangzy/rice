@@ -1,0 +1,114 @@
+// GEE实现随机森林分类问题
+// 选择需要裁剪的矢量数据
+var aoi = ee.FeatureCollection("users/yangyao19960805/NewFolder");
+
+// 加载矢量边框，以便于在边界内选取样本点
+var empty = ee.Image().toByte();
+var outline = empty.paint({
+  featureCollection: aoi, // 行政边界命名为aoi
+  color: 0, // 颜色透明
+  width: 3 // 边界宽度
+});
+Map.addLayer(outline, {palette: "ff0000"}, "outline");
+
+// 云掩膜函数
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// 构建Sentinel 2影像集合，按日期、边界和云量进行筛选
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR')
+                .filterDate('2019-01-01', '2020-12-31')
+                .filterBounds(aoi)
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+                .map(maskS2clouds);
+
+print("Sentinel 2 Image Collection", dataset);
+
+var dem = ee.Image("NASA/NASADEM_HGT/001");
+
+// 计算遥感指数（NDVI、NDWI、EVI、BSI、IBI）
+var add_RS_index = function(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI').copyProperties(img, ['system:time_start']);
+  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI').copyProperties(img, ['system:time_start']);
+  var evi = img.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+    'NIR': img.select('B8'),
+    'RED': img.select('B4'),
+    'BLUE': img.select('B2')
+  }).rename('EVI').copyProperties(img, ['system:time_start']);
+  var bsi = img.expression('((RED + SWIR1) - (NIR + BLUE)) / ((RED + SWIR1) + (NIR + BLUE))', {
+    'RED': img.select('B4'),
+    'BLUE': img.select('B2'),
+    'NIR': img.select('B8'),
+    'SWIR1': img.select('B11')
+  }).rename('BSI').copyProperties(img, ['system:time_start']);
+  var ibi = img.expression('(2 * SWIR1 / (SWIR1 + NIR) - (NIR / (NIR + RED) + GREEN / (GREEN + SWIR1))) / (2 * SWIR1 / (SWIR1 + NIR) + (NIR / (NIR + RED) + GREEN / (GREEN + SWIR1)))', {
+    'SWIR1': img.select('B11'),
+    'NIR': img.select('B8'),
+    'RED': img.select('B4'),
+    'GREEN': img.select('B3')
+  }).rename('IBI').copyProperties(img, ['system:time_start']);
+  return img.addBands([ndvi, ndwi, evi, bsi, ibi]);
+};
+
+var dataset = dataset.map(add_RS_index);
+
+var bands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'NDVI', 'NDWI', 'BSI'];
+var imgcol_median = dataset.select(bands).median();
+var aoi_dem = dem.select('elevation').clip(aoi).rename('DEM');
+var construct_img = imgcol_median.addBands(aoi_dem).clip(aoi);
+
+// 分类样本
+var train_points = cropland.merge(grassland).merge(city).merge(forest).merge(water);
+var train_data = construct_img.sampleRegions({
+  collection: train_points,
+  properties: ['landcover'],
+  scale: 10
+});
+
+// 样本点随机排列和分割
+var withRandom = train_data.randomColumn('random');
+var split = 0.7;
+var trainingPartition = withRandom.filter(ee.Filter.lt('random', split)); // 70% 训练样本
+var testingPartition = withRandom.filter(ee.Filter.gte('random', split)); // 30% 测试样本
+
+// 随机森林分类器
+var rf = ee.Classifier.smileRandomForest({
+  numberOfTrees: 20,
+  bagFraction: 0.8
+}).train({
+  features: train_data,
+  classProperty: 'landcover'
+});
+
+// 影像分类
+var img_classfication = construct_img.classify(rf);
+var test = testingPartition.classify(rf);
+
+// 计算混淆矩阵和精度
+var confusionMatrix = test.errorMatrix('landcover', 'classification');
+print('confusionMatrix', confusionMatrix);
+print('overall accuracy', confusionMatrix.accuracy());
+print('kappa accuracy', confusionMatrix.kappa());
+
+// 地图展示
+Map.centerObject(aoi);
+Map.addLayer(aoi);
+Map.addLayer(img_classfication.clip(aoi), {min: 1, max: 4, palette: ['orange', 'blue', 'green', 'yellow']});
+
+// 导出分类图
+Export.image.toDrive({
+  image: img_classfication.clip(aoi),
+  description: 'rfclass',
+  fileNamePrefix: 'rf',
+  folder: "class",
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e13,
+  crs: "EPSG:4326"
+});
